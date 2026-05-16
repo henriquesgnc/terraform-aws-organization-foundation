@@ -1,0 +1,134 @@
+name: Terraform Apply
+
+on:
+  workflow_dispatch:
+    inputs:
+      stack:
+        description: "Stack to apply"
+        required: true
+        type: choice
+        options:
+          - organizations
+          - identity
+          - cross-account-iam
+          - shared-services
+          - production
+          - sandbox
+      auto_approve:
+        description: "Skip approval gate?"
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      issues: write
+    environment:
+      name: ${{ inputs.stack }}
+      url: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.5"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.TERRAFORM_ROLE }}
+          aws-region: us-east-1
+          role-session-name: tf-apply-${{ github.run_id }}-${{ inputs.stack }}
+
+      - name: Sync Terraform profiles
+        run: |
+          for profile in bootstrapper management; do
+            aws configure set region us-east-1 --profile "$profile"
+            aws configure set aws_access_key_id     "$AWS_ACCESS_KEY_ID"     --profile "$profile"
+            aws configure set aws_secret_access_key "$AWS_SECRET_ACCESS_KEY" --profile "$profile"
+            aws configure set aws_session_token      "$AWS_SESSION_TOKEN"     --profile "$profile"
+          done
+
+      - name: Init
+        working-directory: aws/organizations/${{ contains(fromJSON('["production","sandbox"]'), inputs.stack) && 'workloads' || 'management' }}/${{ inputs.stack }}
+        run: terraform init
+
+      - name: Plan
+        id: plan
+        working-directory: aws/organizations/${{ contains(fromJSON('["production","sandbox"]'), inputs.stack) && 'workloads' || 'management' }}/${{ inputs.stack }}
+        run: |
+          terraform plan -no-color -input=false -out=tfplan 2>&1 | tee /tmp/plan.txt
+          {
+            echo "output<<PLANEOF"
+            cat /tmp/plan.txt
+            echo "PLANEOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Create Approval Issue
+        id: approval
+        uses: actions/github-script@v7
+        if: inputs.auto_approve == false
+        with:
+          script: |
+            const issue = await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Apply Approval: ${context.payload.inputs.stack}`,
+              body: `## :lock: Apply Approval Required\n\n**Stack:** \`${context.payload.inputs.stack}\`\n**Run:** ${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\nReview the plan output. Comment \`approve\` or \`reject\`.\n\n<details><summary>Plan</summary>\n\n\`\`\`\n${{ steps.plan.outputs.output }}\n\`\`\`\n</details>`,
+              labels: ['apply-approval']
+            });
+            return { number: issue.data.number };
+
+      - name: Await Approval
+        uses: actions/github-script@v7
+        if: inputs.auto_approve == false
+        timeout-minutes: 60
+        with:
+          script: |
+            const { number } = ${{ steps.approval.outputs.result }};
+            const { owner, repo } = context.repo;
+
+            for (let i = 0; i < 120; i++) {
+              const { data: comments } = await github.rest.issues.listComments({
+                owner, repo, issue_number: number, sort: 'created', direction: 'desc', per_page: 3
+              });
+              const last = comments[0];
+              if (last && /approve/i.test(last.body)) {
+                await github.rest.issues.update({ owner, repo, issue_number: number, state: 'closed', labels: ['approved'] });
+                await github.rest.issues.createComment({ owner, repo, issue_number: number, body: '## :white_check_mark: Approved. Applying.' });
+                return;
+              }
+              if (last && /reject/i.test(last.body)) {
+                await github.rest.issues.update({ owner, repo, issue_number: number, state: 'closed', labels: ['rejected'] });
+                throw new Error('Apply rejected');
+              }
+              await new Promise(r => setTimeout(r, 30000));
+            }
+            throw new Error('Approval timeout (60m)');
+
+      - name: Apply
+        working-directory: aws/organizations/${{ contains(fromJSON('["production","sandbox"]'), inputs.stack) && 'workloads' || 'management' }}/${{ inputs.stack }}
+        run: |
+          if [ -f tfplan ]; then
+            terraform apply -auto-approve tfplan
+          else
+            terraform apply -auto-approve
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          ICON="${{ job.status == 'success' && ':white_check_mark:' || ':x:' }}"
+          {
+            echo "### ${ICON} Terraform Apply: \`${{ inputs.stack }}\`"
+            echo ""
+            echo "**Status:** ${{ job.status }}"
+            echo "**Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          } >> "$GITHUB_STEP_SUMMARY"

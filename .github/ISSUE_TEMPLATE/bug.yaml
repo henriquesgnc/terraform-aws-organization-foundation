@@ -1,0 +1,35 @@
+---
+name: Bug Report
+about: Report a bug or unexpected behavior
+title: "fix: "
+labels: bug
+assignees: ""
+---
+
+## Description
+
+<!-- What's broken and what impact does it have? -->
+
+## Expected Behavior
+
+<!-- What should happen? -->
+
+## Actual Behavior
+
+<!-- What actually happens? -->
+
+## Steps to Reproduce
+
+1.
+2.
+3.
+
+## Environment
+
+- Terraform version: `terraform version`
+- AWS Provider version:
+- Stack(s) affected:
+
+## Additional Context
+
+<!-- Logs, plan output, error messages -->

@@ -1,0 +1,15 @@
+.terraform/
+.terraform.lock.hcl
+*tfstate
+*tfstate.backup
+*.vscode/
+*.DS_Store
+*.infracost/
+*builds/
+*.zip*
+*.idea
+~/
+
+tfplan*
+__pycache__/
+*.pyc

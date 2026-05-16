@@ -1,0 +1,121 @@
+name: Terraform Plan
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - "aws/**"
+      - "modules/**"
+      - ".github/workflows/terraform-plan.yaml"
+
+permissions:
+  contents: read
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      stacks: ${{ steps.filter.outputs.changes }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            organizations:
+              - "aws/organizations/management/organizations/**"
+              - "modules/aws/organizations/**"
+              - "modules/aws/organizations/scp/**"
+            identity:
+              - "aws/organizations/management/identity/**"
+              - "modules/aws/organizations/**"
+            cross-account-iam:
+              - "aws/organizations/management/cross-account-iam/**"
+              - "modules/aws/organizations/cross-account-iam/**"
+            shared-services:
+              - "aws/organizations/management/shared-services/**"
+              - "modules/aws/vpc/**"
+            production:
+              - "aws/organizations/workloads/production/**"
+              - "modules/aws/vpc/**"
+            sandbox:
+              - "aws/organizations/workloads/sandbox/**"
+              - "modules/aws/vpc/**"
+
+  plan:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.stacks != '[]' && needs.detect-changes.outputs.stacks != ''
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+    strategy:
+      fail-fast: false
+      matrix:
+        stack: ${{ fromJSON(needs.detect-changes.outputs.stacks) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "~1.5"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.TERRAFORM_ROLE }}
+          aws-region: us-east-1
+          role-session-name: tf-plan-${{ github.run_id }}-${{ matrix.stack }}
+
+      - name: Sync Terraform profiles
+        run: |
+          for profile in bootstrapper management; do
+            aws configure set region us-east-1 --profile "$profile"
+            aws configure set aws_access_key_id     "$AWS_ACCESS_KEY_ID"     --profile "$profile"
+            aws configure set aws_secret_access_key "$AWS_SECRET_ACCESS_KEY" --profile "$profile"
+            aws configure set aws_session_token      "$AWS_SESSION_TOKEN"     --profile "$profile"
+          done
+
+      - name: Init ${{ matrix.stack }}
+        working-directory: aws/organizations/${{ contains(fromJSON('["production","sandbox"]'), matrix.stack) && 'workloads' || 'management' }}/${{ matrix.stack }}
+        run: terraform init
+
+      - name: Format Check
+        working-directory: aws/organizations/${{ contains(fromJSON('["production","sandbox"]'), matrix.stack) && 'workloads' || 'management' }}/${{ matrix.stack }}
+        run: terraform fmt -check -recursive
+
+      - name: Validate
+        working-directory: aws/organizations/${{ contains(fromJSON('["production","sandbox"]'), matrix.stack) && 'workloads' || 'management' }}/${{ matrix.stack }}
+        run: terraform validate
+
+      - name: Plan
+        id: plan
+        working-directory: aws/organizations/${{ contains(fromJSON('["production","sandbox"]'), matrix.stack) && 'workloads' || 'management' }}/${{ matrix.stack }}
+        run: |
+          terraform plan -no-color -input=false -out=tfplan \
+            2>&1 | tee /tmp/plan.txt
+          {
+            echo "plan<<EOF"
+            cat /tmp/plan.txt
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Post Plan as PR Comment
+        uses: actions/github-script@v7
+        if: github.event_name == 'pull_request'
+        with:
+          script: |
+            const stack = '${{ matrix.stack }}';
+            const planOutput = `${{ steps.plan.outputs.plan }}`.replace(/%0A/g, '\n').replace(/%3C/g, '<');
+            const noChanges = planOutput.includes('No changes.') || planOutput.includes('0 to add, 0 to change, 0 to destroy');
+
+            const body = noChanges
+              ? `### :white_check_mark: Terraform Plan: \`${stack}\`\n\nNo changes. Infrastructure matches configuration.\n\n<details><summary>Full output</summary>\n\n\`\`\`terraform\n${planOutput}\n\`\`\`\n</details>`
+              : `### :building_construction: Terraform Plan: \`${stack}\`\n\n\`\`\`terraform\n${planOutput}\n\`\`\`\n\n> :warning: Review changes before merging. Apply via [Terraform Apply](${{ github.server_url }}/${{ github.repository }}/actions/workflows/terraform-apply.yaml).`;
+
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });

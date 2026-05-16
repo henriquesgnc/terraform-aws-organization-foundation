@@ -1,0 +1,14 @@
+# Global owners — all PRs require review from these users
+* @henriquesgnc
+
+# Terraform stacks
+aws/organizations/**/*.tf     @henriquesgnc
+
+# Reusable modules
+modules/**/*.tf               @henriquesgnc
+
+# CI/CD
+.github/workflows/*.yaml      @henriquesgnc
+
+# Documentation
+*.md                          @henriquesgnc
